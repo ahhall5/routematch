@@ -15,6 +15,14 @@ and check paths against them directly.
 - `:id` — matches exactly one segment, captured under the name `id`
 - `*rest` — matches one or more remaining segments, captured joined by
   `/`; only valid as the last segment in a pattern
+- `:id?` or `users?` — an optional segment (param or literal); the path
+  may end before it. Optional segments must all sit at the end of the
+  pattern, after every required segment, and a wildcard can't be made
+  optional (it already matches a variable number of segments). If a
+  pattern has more than one trailing optional segment, the path can
+  only supply them in order — you can't skip one and still match the
+  next, e.g. `/x/:a?/:b?` against `/x/one` captures `a=one` and leaves
+  `b` unset, it never treats `one` as `b`.
 
 ## Routes file
 
@@ -27,6 +35,7 @@ user_show   = /users/:id
 user_posts  = /users/:id/posts/:post_id
 static_file = /assets/*path
 health      = /health
+report      = /report/:id/:format?
 ```
 
 ## Usage
@@ -40,6 +49,12 @@ user_posts (/users/:id/posts/:post_id) id=42 post_id=7
 
 $ routematch api.routes /assets/css/site.css
 static_file (/assets/*path) path=css/site.css
+
+$ routematch api.routes /report/42
+report (/report/:id/:format?) id=42
+
+$ routematch api.routes /report/42/json
+report (/report/:id/:format?) id=42 format=json
 
 $ routematch api.routes /unknown
 no route matches '/unknown'
