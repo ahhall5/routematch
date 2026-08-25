@@ -64,6 +64,23 @@ If a path matches more than one route, every matching route is printed,
 in the order it appears in the file — useful for catching accidental
 overlaps between rules.
 
+### JSON output
+
+Pass `--json` (in either argument position) to get matches as a JSON
+array instead of text, for feeding into another script:
+
+```
+$ routematch api.routes /users/42/posts/7 --json
+[{"name":"user_posts","pattern":"/users/:id/posts/:post_id","params":{"id":"42","post_id":"7"}}]
+
+$ routematch api.routes /unknown --json
+[]
+```
+
+Malformed patterns in the routes file are still reported on stderr, not
+folded into the JSON, so a caller reading stdout doesn't have to filter
+them out. The exit code is unchanged: 1 if nothing matched, 0 otherwise.
+
 ## Building
 
 Standard library only, no external dependencies:
