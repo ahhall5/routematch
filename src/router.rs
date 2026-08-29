@@ -130,6 +130,17 @@ pub fn split_path(path: &str) -> Vec<&str> {
     }
 }
 
+/// Splits segments into the leading required run and the trailing
+/// optional run. `parse_pattern` already guarantees every optional
+/// segment sits at the end, so a single split point is enough.
+fn split_optional(segments: &[Segment]) -> (&[Segment], &[Segment]) {
+    let optional_start = segments
+        .iter()
+        .position(|s| matches!(s, Segment::OptionalStatic(_) | Segment::OptionalParam(_)))
+        .unwrap_or(segments.len());
+    segments.split_at(optional_start)
+}
+
 /// Matches parsed segments against a path's components, returning the
 /// captured params in declaration order on success.
 ///
@@ -144,11 +155,7 @@ pub fn match_segments(
     segments: &[Segment],
     path_segments: &[&str],
 ) -> Option<Vec<(String, String)>> {
-    let optional_start = segments
-        .iter()
-        .position(|s| matches!(s, Segment::OptionalStatic(_) | Segment::OptionalParam(_)))
-        .unwrap_or(segments.len());
-    let (required, optional) = segments.split_at(optional_start);
+    let (required, optional) = split_optional(segments);
 
     let mut params = Vec::new();
     let mut path_iter = path_segments.iter();
@@ -212,6 +219,101 @@ pub fn matches(pattern: &str, path: &str) -> Result<Option<Vec<(String, String)>
     let segments = parse_pattern(pattern)?;
     let path_segments = split_path(path);
     Ok(match_segments(&segments, &path_segments))
+}
+
+/// What a given position in a pattern requires of a path component, for
+/// the purposes of checking whether two patterns could ever match the
+/// same path. `Static` values must match literally; everything else
+/// (params, optional params, and anything a wildcard absorbs) matches
+/// any single component, so it's collapsed into `Any`.
+enum PosKind<'a> {
+    Static(&'a str),
+    Any,
+}
+
+/// The number of path components a pattern can match: `min` required,
+/// `max` bounded unless the pattern ends in a wildcard.
+fn length_range(required_len: usize, has_wildcard: bool, optional_len: usize) -> (usize, Option<usize>) {
+    if has_wildcard {
+        (required_len, None)
+    } else {
+        (required_len, Some(required_len + optional_len))
+    }
+}
+
+/// What position `i` in a pattern requires, given its required/optional
+/// split. A trailing wildcard absorbs its own position and everything
+/// after it. Querying a position past a non-wildcard pattern's maximum
+/// length is meaningless for the caller's purposes, so it falls back to
+/// `Any` rather than asserting; `patterns_overlap` never does this since
+/// it bounds `i` by each pattern's own reachable length.
+fn kind_at<'a>(required: &'a [Segment], optional: &'a [Segment], i: usize) -> PosKind<'a> {
+    if let Some(Segment::Wildcard(_)) = required.last() {
+        if i >= required.len() - 1 {
+            return PosKind::Any;
+        }
+    }
+    if let Some(segment) = required.get(i) {
+        return match segment {
+            Segment::Static(s) => PosKind::Static(s.as_str()),
+            Segment::Param(_) | Segment::Wildcard(_) => PosKind::Any,
+            Segment::OptionalStatic(_) | Segment::OptionalParam(_) => {
+                unreachable!("optional segments never appear in the required run")
+            }
+        };
+    }
+    match optional.get(i - required.len()) {
+        Some(Segment::OptionalStatic(s)) => PosKind::Static(s.as_str()),
+        Some(Segment::OptionalParam(_)) | None => PosKind::Any,
+        Some(_) => unreachable!("only OptionalStatic/OptionalParam appear in the optional run"),
+    }
+}
+
+/// Reports whether some path could match both patterns at once. This is
+/// a static check over the pattern text, independent of any particular
+/// path: it exists to flag routes files where two rules could both fire
+/// for the same request, which is easy to introduce by accident once a
+/// file has more than a handful of routes.
+///
+/// Two patterns overlap when their possible path lengths intersect and,
+/// at every position within that overlap, neither requires a literal
+/// value the other rules out. Params, optional params, and wildcards
+/// place no constraint on a component's value, so they never block an
+/// overlap by themselves — only two different literals at the same
+/// position do.
+pub fn patterns_overlap(a: &[Segment], b: &[Segment]) -> bool {
+    let (required_a, optional_a) = split_optional(a);
+    let (required_b, optional_b) = split_optional(b);
+    let wildcard_a = matches!(required_a.last(), Some(Segment::Wildcard(_)));
+    let wildcard_b = matches!(required_b.last(), Some(Segment::Wildcard(_)));
+
+    let (min_a, max_a) = length_range(required_a.len(), wildcard_a, optional_a.len());
+    let (min_b, max_b) = length_range(required_b.len(), wildcard_b, optional_b.len());
+    if min_a > max_b.unwrap_or(usize::MAX) || min_b > max_a.unwrap_or(usize::MAX) {
+        return false;
+    }
+
+    // Beyond this many positions, any still-overlapping length is only
+    // adding wildcard-absorbed or param components, which never rule
+    // an overlap out — so there's no need to check further.
+    let check_upper = match (wildcard_a, wildcard_b) {
+        (false, false) => max_a.unwrap().min(max_b.unwrap()),
+        (true, false) => max_b.unwrap(),
+        (false, true) => max_a.unwrap(),
+        (true, true) => required_a.len().max(required_b.len()),
+    };
+
+    for i in 0..check_upper {
+        if let (PosKind::Static(x), PosKind::Static(y)) = (
+            kind_at(required_a, optional_a, i),
+            kind_at(required_b, optional_b, i),
+        ) {
+            if x != y {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 #[cfg(test)]
@@ -341,5 +443,59 @@ mod tests {
     fn rejects_optional_wildcard() {
         let err = parse_pattern("/files/*rest?").unwrap_err();
         assert!(err.message.contains("cannot be optional"));
+    }
+
+    fn overlap(a: &str, b: &str) -> bool {
+        patterns_overlap(&parse_pattern(a).unwrap(), &parse_pattern(b).unwrap())
+    }
+
+    #[test]
+    fn identical_patterns_overlap() {
+        assert!(overlap("/users/:id", "/users/:id"));
+    }
+
+    #[test]
+    fn param_overlaps_static_at_same_position() {
+        // Both match "/users/42".
+        assert!(overlap("/users/:id", "/users/42"));
+    }
+
+    #[test]
+    fn different_statics_at_same_position_do_not_overlap() {
+        assert!(!overlap("/users/:id", "/accounts/:id"));
+    }
+
+    #[test]
+    fn different_lengths_do_not_overlap() {
+        assert!(!overlap("/users/:id", "/users/:id/posts"));
+    }
+
+    #[test]
+    fn wildcard_overlaps_longer_static_path() {
+        // "/assets/logo.png" matches both.
+        assert!(overlap("/assets/*path", "/assets/logo.png"));
+    }
+
+    #[test]
+    fn wildcard_does_not_overlap_shorter_path() {
+        // The wildcard needs at least one component past "/assets".
+        assert!(!overlap("/assets/*path", "/assets"));
+    }
+
+    #[test]
+    fn two_wildcards_on_different_prefixes_do_not_overlap() {
+        assert!(!overlap("/assets/*path", "/uploads/*path"));
+    }
+
+    #[test]
+    fn optional_trailing_segment_overlaps_shorter_required_route() {
+        // "/report/42" matches both.
+        assert!(overlap("/report/:id", "/report/:id/:format?"));
+    }
+
+    #[test]
+    fn optional_static_mismatch_does_not_block_shorter_overlap() {
+        // Both match "/report/42"; only the optional tail differs.
+        assert!(overlap("/report/:id", "/report/:id/json?"));
     }
 }

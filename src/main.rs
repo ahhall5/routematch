@@ -1,6 +1,6 @@
 mod router;
 
-use router::{matches, PatternError};
+use router::{match_segments, parse_pattern, patterns_overlap, split_path, PatternError, Segment};
 use std::env;
 use std::fs;
 use std::process;
@@ -63,14 +63,23 @@ fn main() {
         process::exit(1);
     }
 
-    let mut hits: Vec<(&Route, Vec<(String, String)>)> = Vec::new();
+    let mut parsed: Vec<(&Route, Vec<Segment>)> = Vec::new();
     for route in &routes {
-        match matches(&route.pattern, path) {
-            Ok(Some(params)) => hits.push((route, params)),
-            Ok(None) => {}
+        match parse_pattern(&route.pattern) {
+            Ok(segments) => parsed.push((route, segments)),
             // Pattern errors always go to stderr, even in --json mode, so
             // a script parsing stdout doesn't have to account for them.
             Err(e) => report_pattern_error(&route.name, &e),
+        }
+    }
+
+    report_overlaps(&parsed);
+
+    let path_segments = split_path(path);
+    let mut hits: Vec<(&Route, Vec<(String, String)>)> = Vec::new();
+    for (route, segments) in &parsed {
+        if let Some(params) = match_segments(segments, &path_segments) {
+            hits.push((route, params));
         }
     }
 
@@ -149,4 +158,23 @@ fn json_string(s: &str) -> String {
 
 fn report_pattern_error(name: &str, err: &PatternError) {
     eprintln!("skipping route '{}': {}", name, err);
+}
+
+/// Warns about every pair of routes that could both match some path.
+/// This is independent of the path given on the command line — it's a
+/// property of the routes file itself, so it runs every time the file
+/// loads rather than only when both routes happen to match this path.
+fn report_overlaps(parsed: &[(&Route, Vec<Segment>)]) {
+    for i in 0..parsed.len() {
+        for j in (i + 1)..parsed.len() {
+            let (route_a, segments_a) = &parsed[i];
+            let (route_b, segments_b) = &parsed[j];
+            if patterns_overlap(segments_a, segments_b) {
+                eprintln!(
+                    "warning: routes '{}' ({}) and '{}' ({}) may both match the same path",
+                    route_a.name, route_a.pattern, route_b.name, route_b.pattern
+                );
+            }
+        }
+    }
 }

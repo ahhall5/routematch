@@ -64,6 +64,24 @@ If a path matches more than one route, every matching route is printed,
 in the order it appears in the file — useful for catching accidental
 overlaps between rules.
 
+### Overlap warnings
+
+On every run, routematch also checks the whole file for pairs of
+patterns that could both match *some* path, regardless of the path you
+actually asked about, and prints a warning for each pair to stderr. For
+example, adding `user_active = /users/active` to `api.routes` above
+would warn on every run, since `active` also satisfies `:id`:
+
+```
+$ routematch api.routes /users/42
+warning: routes 'user_show' (/users/:id) and 'user_active' (/users/active) may both match the same path
+user_show (/users/:id) id=42
+```
+
+This catches routes that shadow each other even when the specific path
+you're testing only happens to hit one of them. It's a static property
+of the file, so the same warnings appear no matter what path you pass.
+
 ### JSON output
 
 Pass `--json` (in either argument position) to get matches as a JSON
