@@ -1,3 +1,4 @@
+use crate::constraint::Constraint;
 use std::fmt;
 
 /// One piece of a parsed route pattern.
@@ -5,6 +6,10 @@ use std::fmt;
 pub enum Segment {
     Static(String),
     Param(String),
+    /// A param constrained to values matching a pattern, e.g.
+    /// `:id(\d+)`. The path component must match the whole constraint,
+    /// not just contain a match somewhere in it.
+    ConstrainedParam(String, Constraint),
     Wildcard(String),
     /// A static segment suffixed with '?'. Only valid as part of a
     /// trailing run of optional segments.
@@ -12,6 +17,8 @@ pub enum Segment {
     /// A param segment suffixed with '?'. Only valid as part of a
     /// trailing run of optional segments.
     OptionalParam(String),
+    /// A constrained param suffixed with '?', combining the two.
+    OptionalConstrainedParam(String, Constraint),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,6 +42,12 @@ impl fmt::Display for PatternError {
 /// would need backtracking the rest of this module doesn't do. A
 /// wildcard already matches a variable number of components, so it
 /// cannot itself be marked optional.
+///
+/// A param may carry a constraint in parens, e.g. ":id(\d+)", requiring
+/// the matched component to satisfy that pattern (see `constraint`
+/// module) rather than just being any single segment. The constraint
+/// suffix can combine with the trailing '?' for an optional constrained
+/// param, e.g. ":id(\d+)?".
 pub fn parse_pattern(pattern: &str) -> Result<Vec<Segment>, PatternError> {
     let trimmed = pattern.trim();
     let body = trimmed.strip_prefix('/').unwrap_or(trimmed);
@@ -68,10 +81,30 @@ pub fn parse_pattern(pattern: &str) -> Result<Vec<Segment>, PatternError> {
                     message: format!("param segment missing a name in '{}'", pattern),
                 });
             }
-            segments.push(if optional {
-                Segment::OptionalParam(name.to_string())
-            } else {
-                Segment::Param(name.to_string())
+            let (param_name, constraint_src) = split_constraint(name, pattern)?;
+            if param_name.is_empty() {
+                return Err(PatternError {
+                    message: format!("param segment missing a name in '{}'", pattern),
+                });
+            }
+            segments.push(match constraint_src {
+                Some(constraint_src) => {
+                    let constraint = Constraint::parse(constraint_src).map_err(|message| {
+                        PatternError {
+                            message: format!(
+                                "in constraint for ':{}' in pattern '{}': {}",
+                                param_name, pattern, message
+                            ),
+                        }
+                    })?;
+                    if optional {
+                        Segment::OptionalConstrainedParam(param_name.to_string(), constraint)
+                    } else {
+                        Segment::ConstrainedParam(param_name.to_string(), constraint)
+                    }
+                }
+                None if optional => Segment::OptionalParam(param_name.to_string()),
+                None => Segment::Param(param_name.to_string()),
             });
         } else if let Some(name) = raw.strip_prefix('*') {
             if name.is_empty() {
@@ -102,7 +135,9 @@ pub fn parse_pattern(pattern: &str) -> Result<Vec<Segment>, PatternError> {
     let mut seen_optional = false;
     for segment in &segments {
         match segment {
-            Segment::OptionalStatic(_) | Segment::OptionalParam(_) => seen_optional = true,
+            Segment::OptionalStatic(_)
+            | Segment::OptionalParam(_)
+            | Segment::OptionalConstrainedParam(_, _) => seen_optional = true,
             _ if seen_optional => {
                 return Err(PatternError {
                     message: format!(
@@ -116,6 +151,29 @@ pub fn parse_pattern(pattern: &str) -> Result<Vec<Segment>, PatternError> {
     }
 
     Ok(segments)
+}
+
+/// Splits a param name like "id(\d+)" into the name and the constraint
+/// body, if any. `name` has already had the leading ':' and any trailing
+/// '?' stripped.
+fn split_constraint<'a>(
+    name: &'a str,
+    pattern: &str,
+) -> Result<(&'a str, Option<&'a str>), PatternError> {
+    match name.find('(') {
+        None => Ok((name, None)),
+        Some(open) => {
+            if !name.ends_with(')') {
+                return Err(PatternError {
+                    message: format!(
+                        "unterminated constraint in ':{}' in pattern '{}'",
+                        name, pattern
+                    ),
+                });
+            }
+            Ok((&name[..open], Some(&name[open + 1..name.len() - 1])))
+        }
+    }
 }
 
 /// Splits a request path into its components. A bare "/" yields no
@@ -136,7 +194,14 @@ pub fn split_path(path: &str) -> Vec<&str> {
 fn split_optional(segments: &[Segment]) -> (&[Segment], &[Segment]) {
     let optional_start = segments
         .iter()
-        .position(|s| matches!(s, Segment::OptionalStatic(_) | Segment::OptionalParam(_)))
+        .position(|s| {
+            matches!(
+                s,
+                Segment::OptionalStatic(_)
+                    | Segment::OptionalParam(_)
+                    | Segment::OptionalConstrainedParam(_, _)
+            )
+        })
         .unwrap_or(segments.len());
     segments.split_at(optional_start)
 }
@@ -178,13 +243,22 @@ pub fn match_segments(
                 let value = path_iter.next()?;
                 params.push((name.clone(), value.to_string()));
             }
+            Segment::ConstrainedParam(name, constraint) => {
+                let value = path_iter.next()?;
+                if !constraint.is_match(value) {
+                    return None;
+                }
+                params.push((name.clone(), value.to_string()));
+            }
             Segment::Static(expected) => {
                 let value = path_iter.next()?;
                 if value != expected {
                     return None;
                 }
             }
-            Segment::OptionalStatic(_) | Segment::OptionalParam(_) => unreachable!(
+            Segment::OptionalStatic(_)
+            | Segment::OptionalParam(_)
+            | Segment::OptionalConstrainedParam(_, _) => unreachable!(
                 "optional segments are always a trailing run split off into `optional`"
             ),
         }
@@ -197,12 +271,20 @@ pub fn match_segments(
         };
         match segment {
             Segment::OptionalParam(name) => params.push((name.clone(), value.to_string())),
+            Segment::OptionalConstrainedParam(name, constraint) => {
+                if !constraint.is_match(value) {
+                    return None;
+                }
+                params.push((name.clone(), value.to_string()));
+            }
             Segment::OptionalStatic(expected) => {
                 if value != expected {
                     return None;
                 }
             }
-            _ => unreachable!("`optional` only ever holds OptionalStatic/OptionalParam"),
+            _ => unreachable!(
+                "`optional` only ever holds OptionalStatic/OptionalParam/OptionalConstrainedParam"
+            ),
         }
     }
 
@@ -224,8 +306,12 @@ pub fn matches(pattern: &str, path: &str) -> Result<Option<Vec<(String, String)>
 /// What a given position in a pattern requires of a path component, for
 /// the purposes of checking whether two patterns could ever match the
 /// same path. `Static` values must match literally; everything else
-/// (params, optional params, and anything a wildcard absorbs) matches
-/// any single component, so it's collapsed into `Any`.
+/// (params, constrained params, optional params, and anything a
+/// wildcard absorbs) matches any single component, so it's collapsed
+/// into `Any`. A constraint might in fact rule out a particular literal,
+/// but checking that would mean running the constraint matcher here, so
+/// this stays a conservative check: it can warn about an overlap that a
+/// constraint actually prevents, never miss a real one.
 enum PosKind<'a> {
     Static(&'a str),
     Any,
@@ -256,16 +342,24 @@ fn kind_at<'a>(required: &'a [Segment], optional: &'a [Segment], i: usize) -> Po
     if let Some(segment) = required.get(i) {
         return match segment {
             Segment::Static(s) => PosKind::Static(s.as_str()),
-            Segment::Param(_) | Segment::Wildcard(_) => PosKind::Any,
-            Segment::OptionalStatic(_) | Segment::OptionalParam(_) => {
+            Segment::Param(_) | Segment::Wildcard(_) | Segment::ConstrainedParam(_, _) => {
+                PosKind::Any
+            }
+            Segment::OptionalStatic(_)
+            | Segment::OptionalParam(_)
+            | Segment::OptionalConstrainedParam(_, _) => {
                 unreachable!("optional segments never appear in the required run")
             }
         };
     }
     match optional.get(i - required.len()) {
         Some(Segment::OptionalStatic(s)) => PosKind::Static(s.as_str()),
-        Some(Segment::OptionalParam(_)) | None => PosKind::Any,
-        Some(_) => unreachable!("only OptionalStatic/OptionalParam appear in the optional run"),
+        Some(Segment::OptionalParam(_)) | Some(Segment::OptionalConstrainedParam(_, _)) | None => {
+            PosKind::Any
+        }
+        Some(_) => unreachable!(
+            "only OptionalStatic/OptionalParam/OptionalConstrainedParam appear in the optional run"
+        ),
     }
 }
 
@@ -443,6 +537,46 @@ mod tests {
     fn rejects_optional_wildcard() {
         let err = parse_pattern("/files/*rest?").unwrap_err();
         assert!(err.message.contains("cannot be optional"));
+    }
+
+    #[test]
+    fn constrained_param_matches_only_conforming_values() {
+        let result = matches(r"/users/:id(\d+)", "/users/42").unwrap();
+        assert_eq!(result, Some(vec![("id".to_string(), "42".to_string())]));
+        assert_eq!(matches(r"/users/:id(\d+)", "/users/abc").unwrap(), None);
+    }
+
+    #[test]
+    fn optional_constrained_param_may_be_absent_or_conform() {
+        assert_eq!(
+            matches(r"/users/:id(\d+)?", "/users").unwrap(),
+            Some(Vec::new())
+        );
+        assert_eq!(
+            matches(r"/users/:id(\d+)?", "/users/42").unwrap(),
+            Some(vec![("id".to_string(), "42".to_string())])
+        );
+        assert_eq!(matches(r"/users/:id(\d+)?", "/users/abc").unwrap(), None);
+    }
+
+    #[test]
+    fn rejects_unterminated_constraint() {
+        let err = parse_pattern(r"/users/:id(\d+").unwrap_err();
+        assert!(err.message.contains("unterminated constraint"));
+    }
+
+    #[test]
+    fn rejects_invalid_constraint_body() {
+        let err = parse_pattern(r"/users/:id()").unwrap_err();
+        assert!(err.message.contains("constraint pattern is empty"));
+    }
+
+    #[test]
+    fn constrained_param_overlaps_with_unconstrained_param() {
+        // The overlap check doesn't run the constraint matcher, so it
+        // conservatively treats this as an overlap even though "abc"
+        // would never satisfy `\d+`.
+        assert!(overlap(r"/users/:id(\d+)", "/users/:name"));
     }
 
     fn overlap(a: &str, b: &str) -> bool {

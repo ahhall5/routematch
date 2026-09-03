@@ -23,6 +23,15 @@ and check paths against them directly.
   only supply them in order — you can't skip one and still match the
   next, e.g. `/x/:a?/:b?` against `/x/one` captures `a=one` and leaves
   `b` unset, it never treats `one` as `b`.
+- `:id(\d+)` — a param constrained to values matching the pattern in
+  parens; the segment only matches if the whole component satisfies it.
+  Combine with `?` for an optional constrained param, e.g. `:id(\d+)?`.
+  The constraint language is a small subset of regex: literal
+  characters, `.` (any character), `\d`/`\D`/`\w`/`\W`/`\s`/`\S`,
+  `[a-z0-9]`-style character classes (with `^` negation and `a-z`
+  ranges), and the `*`, `+`, `?` quantifiers. There's no grouping,
+  alternation, or `{n,m}` repetition — enough to constrain a single
+  segment (`:id(\d+)`, `:slug([a-z0-9-]+)`), not to embed a sub-router.
 
 ## Routes file
 
@@ -31,7 +40,7 @@ the output; blank lines and lines starting with `#` are ignored.
 
 ```
 # api.routes
-user_show   = /users/:id
+user_show   = /users/:id(\d+)
 user_posts  = /users/:id/posts/:post_id
 static_file = /assets/*path
 health      = /health
@@ -42,7 +51,10 @@ report      = /report/:id/:format?
 
 ```
 $ routematch api.routes /users/42
-user_show (/users/:id) id=42
+user_show (/users/:id(\d+)) id=42
+
+$ routematch api.routes /users/abc
+no route matches '/users/abc'
 
 $ routematch api.routes /users/42/posts/7
 user_posts (/users/:id/posts/:post_id) id=42 post_id=7
@@ -74,13 +86,18 @@ would warn on every run, since `active` also satisfies `:id`:
 
 ```
 $ routematch api.routes /users/42
-warning: routes 'user_show' (/users/:id) and 'user_active' (/users/active) may both match the same path
-user_show (/users/:id) id=42
+warning: routes 'user_show' (/users/:id(\d+)) and 'user_active' (/users/active) may both match the same path
+user_show (/users/:id(\d+)) id=42
 ```
 
 This catches routes that shadow each other even when the specific path
 you're testing only happens to hit one of them. It's a static property
 of the file, so the same warnings appear no matter what path you pass.
+The check doesn't evaluate constraints, so it treats `:id(\d+)` the
+same as an unconstrained `:id` here — `active` would never actually
+satisfy `\d+`, but the warning fires anyway. That's deliberate: it
+would rather warn about an overlap a constraint happens to rule out
+than stay quiet about one it doesn't.
 
 ### JSON output
 
@@ -111,7 +128,10 @@ cargo build --release
 
 Everything that actually decides whether a pattern matches a path lives
 in `src/router.rs` as plain functions with no I/O: `parse_pattern`,
-`split_path`, and `match_segments`. `src/main.rs` only handles reading
-the file and printing output. That split is what makes the matching
-logic easy to unit test with `cargo test` — no fixtures, no filesystem,
-just strings in and values out.
+`split_path`, and `match_segments`. `src/constraint.rs` holds the small
+matcher for `:id(\d+)`-style param constraints, kept separate since it's
+a self-contained grammar with its own parser and backtracking matcher.
+`src/main.rs` only handles reading the file and printing output. That
+split is what makes the matching logic easy to unit test with
+`cargo test` — no fixtures, no filesystem, just strings in and values
+out.

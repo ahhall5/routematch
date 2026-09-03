@@ -1,3 +1,4 @@
+mod constraint;
 mod router;
 
 use router::{match_segments, parse_pattern, patterns_overlap, split_path, PatternError, Segment};
