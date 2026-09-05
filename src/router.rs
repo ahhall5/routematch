@@ -295,6 +295,110 @@ pub fn match_segments(
     }
 }
 
+/// Explains why `segments` failed to match `path_segments`. Meant to be
+/// called after `match_segments` already returned `None` for the same
+/// inputs; it walks the same required/optional structure and stops at
+/// the first point of disagreement, since that's the thing a person
+/// staring at a routes file actually wants to know first.
+pub fn explain_mismatch(segments: &[Segment], path_segments: &[&str]) -> String {
+    let (required, optional) = split_optional(segments);
+    let mut idx = 0;
+
+    for segment in required {
+        if let Segment::Wildcard(name) = segment {
+            if idx >= path_segments.len() {
+                return format!(
+                    "wildcard ':{}' needs at least one path segment after position {}, but the path ends there",
+                    name, idx
+                );
+            }
+            return "pattern matches".to_string();
+        }
+
+        if idx >= path_segments.len() {
+            return format!(
+                "path has only {} segment(s), but the pattern requires at least {}",
+                path_segments.len(),
+                required.len()
+            );
+        }
+        let value = path_segments[idx];
+        match segment {
+            Segment::Static(expected) => {
+                if value != expected {
+                    return format!(
+                        "segment {} is '{}', expected literal '{}'",
+                        idx + 1,
+                        value,
+                        expected
+                    );
+                }
+            }
+            Segment::ConstrainedParam(name, constraint) => {
+                if !constraint.is_match(value) {
+                    return format!(
+                        "segment {} ('{}') does not satisfy the constraint on ':{}' ({})",
+                        idx + 1,
+                        value,
+                        name,
+                        constraint.source()
+                    );
+                }
+            }
+            Segment::Param(_) => {}
+            Segment::Wildcard(_) => unreachable!("handled above"),
+            Segment::OptionalStatic(_)
+            | Segment::OptionalParam(_)
+            | Segment::OptionalConstrainedParam(_, _) => {
+                unreachable!("optional segments never appear in the required run")
+            }
+        }
+        idx += 1;
+    }
+
+    for segment in optional {
+        if idx >= path_segments.len() {
+            break;
+        }
+        let value = path_segments[idx];
+        match segment {
+            Segment::OptionalStatic(expected) => {
+                if value != expected {
+                    return format!(
+                        "segment {} is '{}', expected optional literal '{}'",
+                        idx + 1,
+                        value,
+                        expected
+                    );
+                }
+            }
+            Segment::OptionalConstrainedParam(name, constraint) => {
+                if !constraint.is_match(value) {
+                    return format!(
+                        "segment {} ('{}') does not satisfy the constraint on ':{}' ({})",
+                        idx + 1,
+                        value,
+                        name,
+                        constraint.source()
+                    );
+                }
+            }
+            Segment::OptionalParam(_) => {}
+            _ => unreachable!("`optional` only ever holds optional segments"),
+        }
+        idx += 1;
+    }
+
+    if idx < path_segments.len() {
+        format!(
+            "path has {} extra segment(s) beyond what the pattern accounts for",
+            path_segments.len() - idx
+        )
+    } else {
+        "pattern matches".to_string()
+    }
+}
+
 /// Convenience wrapper: parses `pattern` and matches it against `path`
 /// in one call. Returns an error only if the pattern itself is malformed.
 pub fn matches(pattern: &str, path: &str) -> Result<Option<Vec<(String, String)>>, PatternError> {
@@ -631,5 +735,66 @@ mod tests {
     fn optional_static_mismatch_does_not_block_shorter_overlap() {
         // Both match "/report/42"; only the optional tail differs.
         assert!(overlap("/report/:id", "/report/:id/json?"));
+    }
+
+    fn explain(pattern: &str, path: &str) -> String {
+        let segments = parse_pattern(pattern).unwrap();
+        explain_mismatch(&segments, &split_path(path))
+    }
+
+    #[test]
+    fn explains_static_segment_mismatch() {
+        assert_eq!(
+            explain("/users/:id", "/accounts/42"),
+            "segment 1 is 'accounts', expected literal 'users'"
+        );
+    }
+
+    #[test]
+    fn explains_too_few_path_segments() {
+        assert_eq!(
+            explain("/users/:id/posts", "/users/42"),
+            "path has only 2 segment(s), but the pattern requires at least 3"
+        );
+    }
+
+    #[test]
+    fn explains_too_many_path_segments() {
+        assert_eq!(
+            explain("/users/:id", "/users/42/posts"),
+            "path has 1 extra segment(s) beyond what the pattern accounts for"
+        );
+    }
+
+    #[test]
+    fn explains_constraint_failure() {
+        assert_eq!(
+            explain(r"/users/:id(\d+)", "/users/abc"),
+            r"segment 2 ('abc') does not satisfy the constraint on ':id' (\d+)"
+        );
+    }
+
+    #[test]
+    fn explains_wildcard_needing_a_segment() {
+        assert_eq!(
+            explain("/files/*rest", "/files"),
+            "wildcard ':rest' needs at least one path segment after position 1, but the path ends there"
+        );
+    }
+
+    #[test]
+    fn explains_optional_static_mismatch() {
+        assert_eq!(
+            explain("/report/json?", "/report/xml"),
+            "segment 2 is 'xml', expected optional literal 'json'"
+        );
+    }
+
+    #[test]
+    fn explains_optional_constraint_failure() {
+        assert_eq!(
+            explain(r"/users/:id(\d+)?", "/users/abc"),
+            r"segment 2 ('abc') does not satisfy the constraint on ':id' (\d+)"
+        );
     }
 }

@@ -1,7 +1,10 @@
 mod constraint;
 mod router;
 
-use router::{match_segments, parse_pattern, patterns_overlap, split_path, PatternError, Segment};
+use router::{
+    explain_mismatch, match_segments, parse_pattern, patterns_overlap, split_path, PatternError,
+    Segment,
+};
 use std::env;
 use std::fs;
 use std::process;
@@ -34,16 +37,19 @@ fn parse_routes_file(contents: &str) -> Vec<Route> {
 
 fn main() {
     let mut json_output = false;
+    let mut explain = false;
     let mut positional: Vec<String> = Vec::new();
     for arg in env::args().skip(1) {
         if arg == "--json" {
             json_output = true;
+        } else if arg == "--explain" {
+            explain = true;
         } else {
             positional.push(arg);
         }
     }
     if positional.len() != 2 {
-        eprintln!("usage: routematch <routes-file> <path> [--json]");
+        eprintln!("usage: routematch <routes-file> <path> [--json] [--explain]");
         process::exit(2);
     }
 
@@ -79,8 +85,13 @@ fn main() {
     let path_segments = split_path(path);
     let mut hits: Vec<(&Route, Vec<(String, String)>)> = Vec::new();
     for (route, segments) in &parsed {
-        if let Some(params) = match_segments(segments, &path_segments) {
-            hits.push((route, params));
+        match match_segments(segments, &path_segments) {
+            Some(params) => hits.push((route, params)),
+            None if explain => {
+                let reason = explain_mismatch(segments, &path_segments);
+                eprintln!("{} ({}) did not match: {}", route.name, route.pattern, reason);
+            }
+            None => {}
         }
     }
 

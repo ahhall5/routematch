@@ -116,6 +116,26 @@ Malformed patterns in the routes file are still reported on stderr, not
 folded into the JSON, so a caller reading stdout doesn't have to filter
 them out. The exit code is unchanged: 1 if nothing matched, 0 otherwise.
 
+### Explaining non-matches
+
+Pass `--explain` to print, for every route that did *not* match, the
+reason why — which segment disagreed and how. Every non-matching
+route in the file gets its own line:
+
+```
+$ routematch api.routes /users/abc --explain
+user_show (/users/:id(\d+)) did not match: segment 2 ('abc') does not satisfy the constraint on ':id' (\d+)
+user_posts (/users/:id/posts/:post_id) did not match: path has only 2 segment(s), but the pattern requires at least 4
+static_file (/assets/*path) did not match: segment 1 is 'users', expected literal 'assets'
+health (/health) did not match: segment 1 is 'users', expected literal 'health'
+report (/report/:id/:format?) did not match: segment 1 is 'users', expected literal 'report'
+```
+
+This goes to stderr alongside pattern errors and overlap warnings, so
+it doesn't affect `--json` output on stdout. It's meant for the case
+where a path you expected to match doesn't, and it's not obvious which
+route was closest or why it fell short.
+
 ## Building
 
 Standard library only, no external dependencies:
