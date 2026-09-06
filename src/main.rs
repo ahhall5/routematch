@@ -38,18 +38,21 @@ fn parse_routes_file(contents: &str) -> Vec<Route> {
 fn main() {
     let mut json_output = false;
     let mut explain = false;
+    let mut path_only = false;
     let mut positional: Vec<String> = Vec::new();
     for arg in env::args().skip(1) {
         if arg == "--json" {
             json_output = true;
         } else if arg == "--explain" {
             explain = true;
+        } else if arg == "--path-only" {
+            path_only = true;
         } else {
             positional.push(arg);
         }
     }
     if positional.len() != 2 {
-        eprintln!("usage: routematch <routes-file> <path> [--json] [--explain]");
+        eprintln!("usage: routematch <routes-file> <path> [--json] [--explain] [--path-only]");
         process::exit(2);
     }
 
@@ -80,7 +83,9 @@ fn main() {
         }
     }
 
-    report_overlaps(&parsed);
+    if !path_only {
+        report_overlaps(&parsed);
+    }
 
     let path_segments = split_path(path);
     let mut hits: Vec<(&Route, Vec<(String, String)>)> = Vec::new();

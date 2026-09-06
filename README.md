@@ -99,6 +99,16 @@ satisfy `\d+`, but the warning fires anyway. That's deliberate: it
 would rather warn about an overlap a constraint happens to rule out
 than stay quiet about one it doesn't.
 
+The overlap check is quadratic in the number of routes, which is fine
+for the routes files this was built for but noticeable once a file
+has thousands of lines and you're just checking a path against it
+repeatedly. Pass `--path-only` to skip it and only match:
+
+```
+$ routematch api.routes /users/42 --path-only
+user_show (/users/:id(\d+)) id=42
+```
+
 ### JSON output
 
 Pass `--json` (in either argument position) to get matches as a JSON
